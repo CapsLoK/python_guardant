@@ -2,17 +2,24 @@
 
 # Guardant Key Health Check Script
 # Periodically checks Guardant USB key availability and maintains connection
+# Occupies component sessions during key access to prevent conflicts
 
 # Configuration variables (can be overridden via environment variables or command line)
 CHECK_INTERVAL=${GUARDANT_CHECK_INTERVAL:-30}  # Check interval in seconds (default: 30)
 MAX_CLIENTS=${GUARDANT_MAX_CLIENTS:-5}        # Max parallel clients for checking (default: 5)
 LOG_FILE=${GUARDANT_LOG_FILE:-/var/log/guardant_health.log}
 LOCK_FILE="/tmp/guardant_health.lock"
+SESSION_TIMEOUT=${GUARDANT_SESSION_TIMEOUT:-10}  # Session timeout in seconds
+
+# Component session management
+OCCUPY_SESSIONS=${GUARDANT_OCCUPY_SESSIONS:-true}  # Whether to occupy component sessions
+SESSION_COMPONENTS=${GUARDANT_SESSION_COMPONENTS:-"certificate,key,container"}  # Components to occupy sessions for
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Logging function
@@ -50,6 +57,8 @@ check_prerequisites() {
         guardant_tool="guardant-cli"
     elif command -v gc_cli &> /dev/null; then
         guardant_tool="gc_cli"
+    elif command -v gcli &> /dev/null; then
+        guardant_tool="gcli"
     elif [ -x "/usr/bin/gtt" ] || [ -x "/usr/local/bin/gtt" ]; then
         guardant_tool="gtt"
     fi
@@ -61,6 +70,80 @@ check_prerequisites() {
     
     echo "$guardant_tool"
     return 0
+}
+
+# Function to occupy component sessions on the Guardant key
+occupy_component_sessions() {
+    if [ "$OCCUPY_SESSIONS" != "true" ]; then
+        log_message "INFO" "Session occupation is disabled"
+        return 0
+    fi
+    
+    log_message "INFO" "${BLUE}Occupying component sessions for: $SESSION_COMPONENTS${NC}"
+    
+    local session_pids=()
+    local components_array
+    IFS=',' read -ra components_array <<< "$SESSION_COMPONENTS"
+    
+    for component in "${components_array[@]}"; do
+        component=$(echo "$component" | xargs)  # Trim whitespace
+        log_message "INFO" "Opening session for component: $component"
+        
+        (
+            # Create a subshell that holds the session open
+            case $component in
+                "certificate"|"cert")
+                    # Open certificate session using gcli or gtt
+                    if command -v gcli &> /dev/null; then
+                        timeout "$SESSION_TIMEOUT" gcli cert list > /dev/null 2>&1 &
+                    elif command -v gtt &> /dev/null; then
+                        timeout "$SESSION_TIMEOUT" gtt -c > /dev/null 2>&1 &
+                    fi
+                    ;;
+                "key"|"privatekey")
+                    # Open key/session for cryptographic operations
+                    if command -v gcli &> /dev/null; then
+                        timeout "$SESSION_TIMEOUT" gcli key list > /dev/null 2>&1 &
+                    elif command -v gtt &> /dev/null; then
+                        timeout "$SESSION_TIMEOUT" gtt -k > /dev/null 2>&1 &
+                    fi
+                    ;;
+                "container"|"cont")
+                    # Open container session
+                    if command -v gcli &> /dev/null; then
+                        timeout "$SESSION_TIMEOUT" gcli container list > /dev/null 2>&1 &
+                    elif command -v gc_cli &> /dev/null; then
+                        timeout "$SESSION_TIMEOUT" gc_cli list > /dev/null 2>&1 &
+                    fi
+                    ;;
+                *)
+                    log_message "WARNING" "Unknown component type: $component"
+                    ;;
+            esac
+        ) &
+        session_pids+=($!)
+        log_message "INFO" "Session PID for $component: $!"
+    done
+    
+    # Store PIDs for cleanup
+    export GUARDANT_SESSION_PIDS="${session_pids[*]}"
+    
+    log_message "INFO" "${BLUE}Component sessions occupied successfully${NC}"
+    return 0
+}
+
+# Function to release occupied sessions
+release_component_sessions() {
+    if [ -n "$GUARDANT_SESSION_PIDS" ]; then
+        log_message "INFO" "Releasing occupied component sessions..."
+        for pid in $GUARDANT_SESSION_PIDS; do
+            if kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null
+                log_message "INFO" "Released session PID: $pid"
+            fi
+        done
+        unset GUARDANT_SESSION_PIDS
+    fi
 }
 
 # Function to check Guardant key using various methods
@@ -78,8 +161,10 @@ check_guardant_key() {
             ;;
         "usb")
             # Check via USB subsystem
-            if lsusb | grep -i "guardant\|aladdin" &> /dev/null; then
-                result=0
+            if command -v lsusb &> /dev/null; then
+                if lsusb | grep -i "guardant\|aladdin" &> /dev/null; then
+                    result=0
+                fi
             fi
             ;;
         "device")
@@ -223,6 +308,9 @@ perform_key_check() {
     if [ "$check_passed" = true ]; then
         log_message "INFO" "✓ Guardant key is accessible and responding"
         
+        # Occupy component sessions to prevent conflicts with other applications
+        occupy_component_sessions
+        
         # Retrieve and display key information
         log_message "INFO" "========================================="
         log_message "INFO" "GUARDANT KEY INFORMATION:"
@@ -234,6 +322,9 @@ perform_key_check() {
             done
         fi
         log_message "INFO" "========================================="
+        
+        # Release occupied sessions after information retrieval
+        release_component_sessions
         
         return 0
     else
@@ -283,6 +374,8 @@ simulate_clients() {
 # Cleanup function
 cleanup() {
     log_message "INFO" "Received termination signal. Cleaning up..."
+    # Release any occupied sessions before exit
+    release_component_sessions
     rm -f "$LOCK_FILE"
     exit 0
 }
@@ -353,22 +446,37 @@ Guardant Key Health Check Script
 Usage: $0 [OPTIONS]
 
 Options:
-    -i, --interval SECONDS    Check interval in seconds (default: 30)
-    -c, --clients NUMBER      Number of clients to simulate (default: 5)
-    -l, --log FILE            Log file path (default: /var/log/guardant_health.log)
-    -h, --help                Show this help message
-    -t, --test                Run single test and exit
+    -i, --interval SECONDS          Check interval in seconds (default: 30)
+    -c, --clients NUMBER            Number of clients to simulate (default: 5)
+    -l, --log FILE                  Log file path (default: /var/log/guardant_health.log)
+    -h, --help                      Show this help message
+    -t, --test                      Run single test and exit
+    -s, --session-timeout SECONDS   Session timeout for component occupation (default: 10)
+        --occupy-sessions BOOL      Occupy component sessions during check (default: true)
+        --session-components LIST   Comma-separated list of components to occupy 
+                                    (default: certificate,key,container)
 
 Environment Variables:
-    GUARDANT_CHECK_INTERVAL   Check interval in seconds
-    GUARDANT_MAX_CLIENTS      Maximum number of clients
-    GUARDANT_LOG_FILE         Log file path
+    GUARDANT_CHECK_INTERVAL         Check interval in seconds
+    GUARDANT_MAX_CLIENTS            Maximum number of clients
+    GUARDANT_LOG_FILE               Log file path
+    GUARDANT_SESSION_TIMEOUT        Session timeout in seconds
+    GUARDANT_OCCUPY_SESSIONS        Whether to occupy sessions (true/false)
+    GUARDANT_SESSION_COMPONENTS     Components to occupy (comma-separated)
+
+Component Types:
+    certificate, cert    - Certificate session
+    key, privatekey      - Cryptographic key session  
+    container, cont      - Container session
 
 Examples:
-    $0                          # Run with defaults
-    $0 -i 60 -c 3              # Check every 60s with 3 clients
-    $0 --interval 120          # Check every 2 minutes
-    GUARDANT_CHECK_INTERVAL=45 $0  # Using environment variable
+    $0                                  # Run with defaults
+    $0 -i 60 -c 3                       # Check every 60s with 3 clients
+    $0 --interval 120                   # Check every 2 minutes
+    $0 --occupy-sessions false          # Disable session occupation
+    $0 --session-components cert,key    # Only occupy cert and key sessions
+    GUARDANT_CHECK_INTERVAL=45 $0       # Using environment variable
+    GUARDANT_OCCUPY_SESSIONS=false $0   # Disable via env variable
 
 EOF
 }
@@ -389,6 +497,18 @@ parse_args() {
                 ;;
             -l|--log)
                 LOG_FILE="$2"
+                shift 2
+                ;;
+            -s|--session-timeout)
+                SESSION_TIMEOUT="$2"
+                shift 2
+                ;;
+            --occupy-sessions)
+                OCCUPY_SESSIONS="$2"
+                shift 2
+                ;;
+            --session-components)
+                SESSION_COMPONENTS="$2"
                 shift 2
                 ;;
             -t|--test)
@@ -415,6 +535,17 @@ parse_args() {
     
     if ! [[ "$MAX_CLIENTS" =~ ^[0-9]+$ ]] || [ "$MAX_CLIENTS" -lt 1 ]; then
         log_message "ERROR" "Invalid clients count: must be a positive integer"
+        exit 1
+    fi
+    
+    if ! [[ "$SESSION_TIMEOUT" =~ ^[0-9]+$ ]] || [ "$SESSION_TIMEOUT" -lt 1 ]; then
+        log_message "ERROR" "Invalid session timeout: must be a positive integer"
+        exit 1
+    fi
+    
+    # Validate occupy sessions boolean
+    if [[ "$OCCUPY_SESSIONS" != "true" && "$OCCUPY_SESSIONS" != "false" ]]; then
+        log_message "ERROR" "Invalid occupy-sessions value: must be 'true' or 'false'"
         exit 1
     fi
     
